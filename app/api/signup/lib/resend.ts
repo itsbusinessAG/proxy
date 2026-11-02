@@ -1,0 +1,823 @@
+import { Resend } from "resend";
+import { productLabel, type ProductId } from "../../../products";
+import { buildLicensePdf } from "./license-pdf";
+import { createLinkToken } from "../../license/lib/link-token";
+
+const LOG_PREFIX = "[signup][resend]";
+
+interface WelcomeInput {
+  toEmail: string;
+  customerName: string;
+  company: string;
+  licenseKey: string;
+  licenseExpiry: string | null;
+  // Base URL of this deployment, used to build the .npmrc registry snippet.
+  origin: string;
+  quickstartUrlEn: string;
+  quickstartUrlDe: string;
+  // Stripe billing-portal link (only for subscription-backed trials, Variante A):
+  // where the customer adds a card to convert the trial. Omitted → no section.
+  portalUrl?: string;
+  // Optional self-serve "add the other product" link (#39) + its display name.
+  addProductUrl?: string;
+  addProductLabel?: string;
+}
+
+// "Add a card to keep going" section for the welcome mails — only when the trial
+// is subscription-backed (a portal link exists). #34.
+function billingBlock(portalUrl?: string): { html: string; text: string[] } {
+  if (!portalUrl) return { html: "", text: [] };
+  return {
+    html: `
+    <h2>Keep going after your trial</h2>
+    <p>Your trial converts to a paid subscription only if you add a payment method.
+       Manage billing (add a card, view invoices, cancel) here:</p>
+    <p><a href="${portalUrl}">Manage your subscription</a></p>`,
+    text: [
+      ``,
+      `Keep going after your trial — add a payment method to convert it to a paid`,
+      `subscription (or cancel) in the billing portal:`,
+      `   ${portalUrl}`,
+    ],
+  };
+}
+
+// Optional "add the other product" self-service link (#39): opens a Stripe-hosted
+// Checkout bound to the customer's EXISTING Stripe customer
+// (/api/license/add-product), so the added product's subscription lands on the
+// same customer and shows in the same portal. Omitted → no section.
+function crossSellBlock(url?: string, productName?: string): { html: string; text: string[] } {
+  if (!url || !productName) return { html: "", text: [] };
+  const name = escape(productName);
+  return {
+    html: `
+    <h2>Want to try ${name} too?</h2>
+    <p>Start a free ${name} trial on the same account — no card required now. You
+       confirm on Stripe and get the key by email, just like this one:</p>
+    <p><a href="${url}">Start ${name} trial</a></p>`,
+    text: [
+      ``,
+      `Want to try ${productName} too? Start a free trial on the same account`,
+      `(no card required now — you confirm on Stripe and get the key by email):`,
+      `   ${url}`,
+    ],
+  };
+}
+
+interface SupportNotifyInput {
+  customerName: string;
+  customerEmail: string;
+  company: string;
+  licenseId: string;
+  licenseKey: string;
+  product: ProductId;
+}
+
+export async function sendWelcomeEmail(
+  input: WelcomeInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+
+  const licensePdf = await buildLicensePdf({
+    productName: productLabel("FW"),
+    licensee: input.customerName,
+    company: input.company,
+    licenseKey: input.licenseKey,
+    expiresAt: input.licenseExpiry,
+  });
+
+  if (dryRun) {
+    console.log(
+      `${LOG_PREFIX} DRY_RUN — would send welcome to ${input.toEmail} with a ${licensePdf.length}-byte license PDF`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  const expiryLine = input.licenseExpiry
+    ? `Your trial is active until <strong>${new Date(input.licenseExpiry).toLocaleDateString("en-GB")}</strong>.`
+    : `Your trial is now active.`;
+
+  // License-brokered npm registry: the customer installs @itsbusinessag/cc-testframework
+  // with only their license key — no GitHub account. The registry lives under
+  // /api/tmgmt/npm and authenticates the same CC_LICENSE_KEY as the runtime.
+  const origin = input.origin.replace(/\/$/, "");
+  const registryPath = "/api/tmgmt/npm/";
+  const registryUrl = `${origin}${registryPath}`;
+  const authRef = `${origin.replace(/^https?:/, "")}${registryPath}`; // //host/api/tmgmt/npm/
+  const npmrc = `@itsbusinessag:registry=${registryUrl}\n${authRef}:_authToken=${input.licenseKey}`;
+
+  const billing = billingBlock(input.portalUrl);
+  const crossSell = crossSellBlock(input.addProductUrl, input.addProductLabel);
+
+  const html = `
+    <h1>Welcome to cc-testframework</h1>
+    <p>Hi ${escape(input.customerName)},</p>
+    <p>your trial is ready. ${expiryLine}</p>
+    <h2>1. Configure your license key</h2>
+    <p>Set this environment variable on the machine that runs the tests. The same
+       key also authenticates the package registry:</p>
+    <pre>CC_LICENSE_KEY=${escape(input.licenseKey)}</pre>
+    <p style="color:#64748b;font-size:13px">Keep this key safe — it authenticates
+       the package registry and is tied to your license; if it expires or is
+       revoked, installs and updates will stop.</p>
+    <h2>2. Point npm at the license-gated registry</h2>
+    <p>Add this to your project's <code>.npmrc</code>:</p>
+    <pre>${escape(npmrc)}</pre>
+    <p>then install the framework as usual:</p>
+    <pre>npm install @itsbusinessag/cc-testframework</pre>
+    <h2>3. Read the quickstart</h2>
+    <p>
+      <a href="${input.quickstartUrlEn}">English</a> &nbsp;|&nbsp;
+      <a href="${input.quickstartUrlDe}">Deutsch</a>
+    </p>
+    ${billing.html}
+    ${crossSell.html}
+    <hr>
+    <p>Questions? Reply to this email or reach us at
+       <a href="mailto:sales@itsbusiness.ch">sales@itsbusiness.ch</a>.</p>
+  `;
+
+  const text = [
+    `Welcome to cc-testframework`,
+    ``,
+    `Hi ${input.customerName},`,
+    ``,
+    `your trial is ready. ${expiryLine.replace(/<[^>]+>/g, "")}`,
+    ``,
+    `1. Configure your license (also authenticates the registry):`,
+    `   CC_LICENSE_KEY=${input.licenseKey}`,
+    `   Keep this key safe — it is tied to your license; if it expires or is revoked, installs and updates will stop.`,
+    `2. Add this to your project's .npmrc:`,
+    ...npmrc.split("\n").map((l) => `   ${l}`),
+    `   then: npm install @itsbusinessag/cc-testframework`,
+    `3. Read the quickstart:`,
+    `   English: ${input.quickstartUrlEn}`,
+    `   Deutsch: ${input.quickstartUrlDe}`,
+    ...billing.text,
+    ...crossSell.text,
+    ``,
+    `Questions? sales@itsbusiness.ch`,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from,
+    to: input.toEmail,
+    subject: "Your cc-testframework trial is ready",
+    html,
+    text,
+    attachments: [
+      {
+        filename: "cc-testframework-license.pdf",
+        content: Buffer.from(licensePdf),
+      },
+    ],
+  });
+
+  if (result.error) {
+    throw new Error(`Resend welcome send failed: ${result.error.message}`);
+  }
+  console.log(`${LOG_PREFIX} welcome sent to ${input.toEmail} (id=${result.data?.id})`);
+}
+
+interface ReminderInput {
+  toEmail: string;
+  customerName: string;
+  licenseKey: string;
+  expiresAt: string;
+  salesEmail: string;
+}
+
+export async function sendReminderEmail(
+  input: ReminderInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+
+  if (dryRun) {
+    console.log(
+      `[cron][resend] DRY_RUN — would send reminder to ${input.toEmail}`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  const expiresOn = new Date(input.expiresAt).toLocaleDateString("en-GB");
+
+  const html = `
+    <h1>Your cc-testframework trial ends soon</h1>
+    <p>Hi ${escape(input.customerName)},</p>
+    <p>your trial expires on <strong>${expiresOn}</strong>.</p>
+    <p>If you would like to continue using cc-testframework beyond the
+       trial, please reach out to our sales team at
+       <a href="mailto:${input.salesEmail}">${input.salesEmail}</a>.
+       We will arrange a paid license that converts your existing
+       setup without any reinstall.</p>
+    <p>No action is required if you would prefer to let the trial
+       expire — tests will continue to run, but you will see expiry
+       warnings in the output.</p>
+    <hr>
+    <p>Your license key (for reference):</p>
+    <pre>${escape(input.licenseKey)}</pre>
+  `;
+
+  const text = [
+    `Your cc-testframework trial ends soon`,
+    ``,
+    `Hi ${input.customerName},`,
+    ``,
+    `your trial expires on ${expiresOn}.`,
+    ``,
+    `If you would like to continue using cc-testframework beyond the trial,`,
+    `please reach out to ${input.salesEmail}. We will arrange a paid license`,
+    `that converts your existing setup without any reinstall.`,
+    ``,
+    `No action is required if you would prefer to let the trial expire.`,
+    ``,
+    `Your license key (for reference): ${input.licenseKey}`,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from,
+    to: input.toEmail,
+    subject: "Your cc-testframework trial ends in 2 days",
+    html,
+    text,
+  });
+
+  if (result.error) {
+    throw new Error(`Resend reminder send failed: ${result.error.message}`);
+  }
+  console.log(
+    `[cron][resend] reminder sent to ${input.toEmail} (id=${result.data?.id})`,
+  );
+}
+
+interface DemoRequestInput {
+  customerName: string;
+  customerEmail: string;
+  company: string;
+  useCase: string;
+  salesActionUrl: string;
+  product: ProductId;
+}
+
+export async function notifyDemoRequest(
+  input: DemoRequestInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+  const to = required("SALES_NOTIFY_EMAIL");
+
+  if (dryRun) {
+    console.log(
+      `[demo-request][resend] DRY_RUN — would notify ${to} about ${input.customerEmail} (action=${input.salesActionUrl})`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  const html = `
+    <p>New demo request received. After vetting, send the signup link with one click:</p>
+    <p><a href="${input.salesActionUrl}" style="display:inline-block;background:#0f172a;color:#fff;padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:600;font-size:15px">Approve and issue signup link</a></p>
+    <p style="color:#64748b;font-size:13px">The button opens a confirm page (no login required, signed link, valid 24 hours). One more click there will issue the trial token and email the personalized signup URL to the customer.</p>
+    <hr>
+    <table style="border-collapse:collapse">
+      <tr><td style="padding:4px 12px 4px 0"><strong>Product</strong></td><td>${escape(productLabel(input.product))}</td></tr>
+      <tr><td style="padding:4px 12px 4px 0"><strong>Name</strong></td><td>${escape(input.customerName)}</td></tr>
+      <tr><td style="padding:4px 12px 4px 0"><strong>Email</strong></td><td>${escape(input.customerEmail)}</td></tr>
+      <tr><td style="padding:4px 12px 4px 0"><strong>Company</strong></td><td>${escape(input.company)}</td></tr>
+    </table>
+    <p><strong>Use case</strong></p>
+    <pre style="white-space:pre-wrap;background:#f1f5f9;padding:12px;border-radius:6px;font-family:ui-monospace,Menlo,monospace;font-size:13px">${escape(input.useCase)}</pre>
+  `;
+
+  const text = [
+    `New demo request received.`,
+    ``,
+    `Approve and issue the signup link in one click:`,
+    input.salesActionUrl,
+    ``,
+    `Product:  ${productLabel(input.product)}`,
+    `Name:     ${input.customerName}`,
+    `Email:    ${input.customerEmail}`,
+    `Company:  ${input.company}`,
+    ``,
+    `Use case:`,
+    input.useCase,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from,
+    to,
+    subject: `[${productLabel(input.product)}] Demo request: ${input.company}`,
+    html,
+    text,
+    replyTo: input.customerEmail,
+  });
+
+  if (result.error) {
+    throw new Error(
+      `Resend demo-request notify failed: ${result.error.message}`,
+    );
+  }
+  console.log(
+    `[demo-request][resend] sales notified about ${input.customerEmail} (id=${result.data?.id})`,
+  );
+}
+
+interface OnboardInviteInput {
+  customerName: string;
+  toEmail: string;
+  onboardUrl: string;
+  expiresAt: string;
+}
+
+export async function sendOnboardInvite(
+  input: OnboardInviteInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+
+  if (dryRun) {
+    console.log(
+      `[sales][resend] DRY_RUN — would send onboard invite to ${input.toEmail}`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  const expiresOn = new Date(input.expiresAt).toLocaleDateString("en-GB");
+
+  const html = `
+    <h1>Your cc-testframework trial is ready to activate</h1>
+    <p>Hi ${escape(input.customerName)},</p>
+    <p>thank you for your interest. Please complete your trial signup
+       using the personalized link below:</p>
+    <p><a href="${input.onboardUrl}">${input.onboardUrl}</a></p>
+    <p>This link is valid until <strong>${expiresOn}</strong> and can
+       only be used once.</p>
+    <hr>
+    <p>Questions? Reply to this email or reach us at
+       <a href="mailto:sales@itsbusiness.ch">sales@itsbusiness.ch</a>.</p>
+  `;
+
+  const text = [
+    `Your cc-testframework trial is ready to activate`,
+    ``,
+    `Hi ${input.customerName},`,
+    ``,
+    `thank you for your interest. Please complete your trial signup`,
+    `using the personalized link below:`,
+    ``,
+    input.onboardUrl,
+    ``,
+    `This link is valid until ${expiresOn} and can only be used once.`,
+    ``,
+    `Questions? sales@itsbusiness.ch`,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from,
+    to: input.toEmail,
+    subject: "Your cc-testframework trial — complete your signup",
+    html,
+    text,
+  });
+
+  if (result.error) {
+    throw new Error(`Resend onboard invite failed: ${result.error.message}`);
+  }
+  console.log(
+    `[sales][resend] onboard invite sent to ${input.toEmail} (id=${result.data?.id})`,
+  );
+}
+
+interface TmgmtWelcomeInput {
+  toEmail: string;
+  customerName: string;
+  company: string;
+  // One access code per seat (#39): a single-seat trial has one, a multi-seat
+  // trial has N — one device-bound key per user.
+  licenseKeys: string[];
+  licenseExpiry: string | null;
+  // Base URL of this deployment, used to build gated download links.
+  origin: string;
+  // Stripe billing-portal link (subscription-backed trials, Variante A). #34.
+  portalUrl?: string;
+  // Optional self-serve "add the other product" link (#39) + its display name.
+  addProductUrl?: string;
+  addProductLabel?: string;
+}
+
+export async function sendTmgmtWelcome(
+  input: TmgmtWelcomeInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+
+  const keys = input.licenseKeys.filter((k) => k);
+  const multi = keys.length > 1;
+
+  // One license PDF per seat.
+  const licensePdfs = await Promise.all(
+    keys.map((key) =>
+      buildLicensePdf({
+        productName: productLabel("TMT"),
+        licensee: input.customerName,
+        company: input.company,
+        licenseKey: key,
+        expiresAt: input.licenseExpiry,
+      }),
+    ),
+  );
+
+  if (dryRun) {
+    console.log(
+      `${LOG_PREFIX} DRY_RUN — would send cc-tmgmt welcome to ${input.toEmail} with ${keys.length} access code(s) and ${licensePdfs.length} license PDF(s)`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  // The gated download works with any valid key — use the first seat's, wrapped
+  // in a short-lived opaque token so the raw key never travels in the URL (#37).
+  const dlToken = createLinkToken(keys[0] ?? "", "download");
+  const downloadUrl = (os: "win" | "mac" | "linux") =>
+    `${input.origin}/api/tmgmt/download?os=${os}&t=${encodeURIComponent(dlToken)}`;
+
+  const codeRows = keys.map((k, i) => (multi ? `Seat ${i + 1}: ${k}` : k)).join("\n");
+  const codeHeading = multi ? "2. Enter the access code per user" : "2. Enter your access code";
+  const codeIntro = multi
+    ? "Start the app on each user's machine and paste that user's access code when prompted:"
+    : "Start the app and paste this access code when prompted:";
+  const billing = billingBlock(input.portalUrl);
+  const crossSell = crossSellBlock(input.addProductUrl, input.addProductLabel);
+
+  const html = `
+    <h1>Welcome to Verify Test Management</h1>
+    <p>Hi ${escape(input.customerName)},</p>
+    <p>your Verify Test Management access is ready. The desktop app downloads,
+       updates, and authenticates with the access code${multi ? "s" : ""} below — no GitHub
+       account required.</p>
+    <h2>1. Download the app</h2>
+    <p>
+      <a href="${downloadUrl("win")}">Windows</a> &nbsp;|&nbsp;
+      <a href="${downloadUrl("mac")}">macOS</a> &nbsp;|&nbsp;
+      <a href="${downloadUrl("linux")}">Linux</a>
+    </p>
+    <h2>${codeHeading}</h2>
+    <p>${codeIntro}</p>
+    <pre>${escape(codeRows)}</pre>
+    <p style="color:#64748b;font-size:13px">Keep ${multi ? "these codes" : "this code"} safe — ${multi ? "they unlock" : "it unlocks"} the
+       app and its automatic updates. ${multi ? "Each is" : "It is"} tied to your license; if it expires
+       or is revoked, the app will stop updating.</p>
+    ${billing.html}
+    ${crossSell.html}
+    <hr>
+    <p>Questions? Reply to this email or reach us at
+       <a href="mailto:sales@itsbusiness.ch">sales@itsbusiness.ch</a>.</p>
+  `;
+
+  const text = [
+    `Welcome to Verify Test Management`,
+    ``,
+    `Hi ${input.customerName},`,
+    ``,
+    `your Verify Test Management access is ready. The desktop app downloads,`,
+    `updates, and authenticates with the access code${multi ? "s" : ""} below — no GitHub account`,
+    `required.`,
+    ``,
+    `1. Download the app:`,
+    `   Windows: ${downloadUrl("win")}`,
+    `   macOS:   ${downloadUrl("mac")}`,
+    `   Linux:   ${downloadUrl("linux")}`,
+    `2. ${codeIntro}`,
+    ...codeRows.split("\n").map((l) => `   ${l}`),
+    ``,
+    `Keep ${multi ? "these codes" : "this code"} safe — ${multi ? "they unlock" : "it unlocks"} the app and its automatic updates.`,
+    ...billing.text,
+    ...crossSell.text,
+    ``,
+    `Questions? sales@itsbusiness.ch`,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from,
+    to: input.toEmail,
+    subject: "Your Verify Test Management access is ready",
+    html,
+    text,
+    attachments: licensePdfs.map((pdf, i) => ({
+      filename: multi
+        ? `Verify-Test-Management-license-seat-${i + 1}.pdf`
+        : "Verify-Test-Management-license.pdf",
+      content: Buffer.from(pdf),
+    })),
+  });
+
+  if (result.error) {
+    throw new Error(`Resend cc-tmgmt welcome send failed: ${result.error.message}`);
+  }
+  console.log(
+    `${LOG_PREFIX} cc-tmgmt welcome sent to ${input.toEmail} (id=${result.data?.id})`,
+  );
+}
+
+interface ProfessionalWelcomeInput {
+  toEmail: string;
+  customerName: string;
+  company: string;
+  fwKey: string;
+  tmtKeys: string[];
+  licenseExpiry: string | null;
+  origin: string;
+  quickstartUrlEn: string;
+  quickstartUrlDe: string;
+  portalUrl?: string;
+}
+
+/**
+ * Combined welcome mail for the Professional bundle (#42): ONE mail with a clearly
+ * separated Framework section (CC_LICENSE_KEY + npm registry + quickstart) and a
+ * Verify Test Management section (download + per-user access codes). Attaches the
+ * FW license PDF plus one TMT license PDF per seat.
+ */
+export async function sendProfessionalWelcome(
+  input: ProfessionalWelcomeInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+
+  const fwPdf = await buildLicensePdf({
+    productName: productLabel("FW"),
+    licensee: input.customerName,
+    company: input.company,
+    licenseKey: input.fwKey,
+    expiresAt: input.licenseExpiry,
+  });
+  const tmtPdfs = await Promise.all(
+    input.tmtKeys.map((key) =>
+      buildLicensePdf({
+        productName: productLabel("TMT"),
+        licensee: input.customerName,
+        company: input.company,
+        licenseKey: key,
+        expiresAt: input.licenseExpiry,
+      }),
+    ),
+  );
+
+  if (dryRun) {
+    console.log(
+      `${LOG_PREFIX} DRY_RUN — would send Professional welcome to ${input.toEmail} (1 FW key + ${input.tmtKeys.length} TMT key(s), ${1 + tmtPdfs.length} PDFs)`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  const expiryLine = input.licenseExpiry
+    ? `Your trial is active until <strong>${new Date(input.licenseExpiry).toLocaleDateString("en-GB")}</strong>.`
+    : `Your trial is now active.`;
+
+  const origin = input.origin.replace(/\/$/, "");
+  const registryPath = "/api/tmgmt/npm/";
+  const registryUrl = `${origin}${registryPath}`;
+  const authRef = `${origin.replace(/^https?:/, "")}${registryPath}`;
+  const npmrc = `@itsbusinessag:registry=${registryUrl}\n${authRef}:_authToken=${input.fwKey}`;
+  // Download link carries a short-lived opaque token, not the raw key (#37).
+  const dlToken = createLinkToken(input.tmtKeys[0] ?? "", "download");
+  const downloadUrl = (os: "win" | "mac" | "linux") =>
+    `${origin}/api/tmgmt/download?os=${os}&t=${encodeURIComponent(dlToken)}`;
+
+  const tmtRows = input.tmtKeys
+    .map((k, i) => (input.tmtKeys.length === 1 ? k : `Seat ${i + 1}: ${k}`))
+    .join("\n");
+  const billing = billingBlock(input.portalUrl);
+
+  const html = `
+    <h1>Welcome to Professional</h1>
+    <p>Hi ${escape(input.customerName)},</p>
+    <p>your Professional trial is ready — it bundles <strong>CC-Testframework</strong>
+       and <strong>Verify Test Management</strong>. ${expiryLine}</p>
+
+    <h2>CC-Testframework (for your test runs / CI)</h2>
+    <p>One license key for the framework. Set it on the machine that runs the
+       tests; the same key also authenticates the package registry:</p>
+    <pre>CC_LICENSE_KEY=${escape(input.fwKey)}</pre>
+    <p>Point npm at the license-gated registry (project <code>.npmrc</code>):</p>
+    <pre>${escape(npmrc)}</pre>
+    <pre>npm install @itsbusinessag/cc-testframework</pre>
+    <p>Quickstart: <a href="${input.quickstartUrlEn}">English</a> &nbsp;|&nbsp;
+       <a href="${input.quickstartUrlDe}">Deutsch</a></p>
+
+    <h2>Verify Test Management (the desktop app, one key per user)</h2>
+    <p>Download the app:
+       <a href="${downloadUrl("win")}">Windows</a> &nbsp;|&nbsp;
+       <a href="${downloadUrl("mac")}">macOS</a> &nbsp;|&nbsp;
+       <a href="${downloadUrl("linux")}">Linux</a></p>
+    <p>Start the app and enter the access code for the respective user:</p>
+    <pre>${escape(tmtRows)}</pre>
+
+    <p style="color:#64748b;font-size:13px">Keep these keys safe — they are tied to
+       your license; if it expires or is revoked, installs, updates and the app
+       stop working.</p>
+    ${billing.html}
+    <hr>
+    <p>Questions? Reply to this email or reach us at
+       <a href="mailto:sales@itsbusiness.ch">sales@itsbusiness.ch</a>.</p>
+  `;
+
+  const text = [
+    `Welcome to Professional`,
+    ``,
+    `Hi ${input.customerName},`,
+    ``,
+    `your Professional trial is ready (CC-Testframework + Verify Test Management). ${expiryLine.replace(/<[^>]+>/g, "")}`,
+    ``,
+    `== CC-Testframework (test runs / CI) ==`,
+    `Configure your license (also authenticates the registry):`,
+    `   CC_LICENSE_KEY=${input.fwKey}`,
+    `.npmrc:`,
+    ...npmrc.split("\n").map((l) => `   ${l}`),
+    `   then: npm install @itsbusinessag/cc-testframework`,
+    `Quickstart EN: ${input.quickstartUrlEn}`,
+    `Quickstart DE: ${input.quickstartUrlDe}`,
+    ``,
+    `== Verify Test Management (desktop app, one key per user) ==`,
+    `Download: Windows ${downloadUrl("win")} | macOS ${downloadUrl("mac")} | Linux ${downloadUrl("linux")}`,
+    `Access code(s):`,
+    ...tmtRows.split("\n").map((l) => `   ${l}`),
+    ``,
+    `Keep these keys safe — tied to your license; if it expires or is revoked, installs/updates and the app stop.`,
+    ...billing.text,
+    ``,
+    `Questions? sales@itsbusiness.ch`,
+  ].join("\n");
+
+  const attachments = [
+    { filename: "CC-Testframework-license.pdf", content: Buffer.from(fwPdf) },
+    ...tmtPdfs.map((pdf, i) => ({
+      filename:
+        tmtPdfs.length === 1
+          ? "Verify-Test-Management-license.pdf"
+          : `Verify-Test-Management-license-seat-${i + 1}.pdf`,
+      content: Buffer.from(pdf),
+    })),
+  ];
+
+  const result = await resend.emails.send({
+    from,
+    to: input.toEmail,
+    subject: "Your Professional trial is ready (CC-Testframework + Verify Test Management)",
+    html,
+    text,
+    attachments,
+  });
+  if (result.error) {
+    throw new Error(`Resend Professional welcome send failed: ${result.error.message}`);
+  }
+  console.log(`${LOG_PREFIX} Professional welcome sent to ${input.toEmail} (id=${result.data?.id})`);
+}
+
+interface SubscriptionKeysInput {
+  toEmail: string;
+  company: string;
+  // One section per product. A single-product subscription has one group; a
+  // Professional subscription has two (FW + TMT) in ONE mail (#42).
+  groups: { productName: string; keys: string[] }[];
+  expiresAt: string;
+}
+
+export async function sendSubscriptionKeys(
+  input: SubscriptionKeysInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+  const totalKeys = input.groups.reduce((n, g) => n + g.keys.length, 0);
+
+  if (dryRun) {
+    console.log(
+      `${LOG_PREFIX} DRY_RUN — would send ${totalKeys} key(s) across ${input.groups.length} product(s) to ${input.toEmail}`,
+    );
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+  const renewsOn = new Date(input.expiresAt).toLocaleDateString("en-GB");
+  const multi = input.groups.length > 1;
+  const title = multi
+    ? "Your license keys"
+    : `Your ${input.groups[0]?.productName ?? "subscription"} license keys`;
+
+  const rowsFor = (keys: string[]) =>
+    keys.length === 1 ? keys[0] : keys.map((k, i) => `Seat ${i + 1}: ${k}`).join("\n");
+
+  const htmlSections = input.groups
+    .map(
+      (g) => `
+    <h2>${escape(g.productName)}</h2>
+    <pre>${escape(rowsFor(g.keys))}</pre>`,
+    )
+    .join("");
+  const html = `
+    <h1>${escape(title)}</h1>
+    <p>Thank you for your subscription. Your license key${totalKeys === 1 ? "" : "s"} per product:</p>
+    ${htmlSections}
+    <p>Your subscription renews on <strong>${renewsOn}</strong>; the keys stay valid as long as the subscription is active.</p>
+    <hr>
+    <p>Questions? Reach us at
+       <a href="mailto:sales@itsbusiness.ch">sales@itsbusiness.ch</a>.</p>
+  `;
+  const textSections = input.groups
+    .flatMap((g) => [`${g.productName}:`, rowsFor(g.keys), ``]);
+  const text = [
+    title,
+    ``,
+    `Thank you for your subscription. Your license key(s) per product:`,
+    ``,
+    ...textSections,
+    `Renews on ${renewsOn}; keys stay valid while the subscription is active.`,
+    ``,
+    `Questions? sales@itsbusiness.ch`,
+  ].join("\n");
+
+  const result = await resend.emails.send({ from, to: input.toEmail, subject: title, html, text });
+  if (result.error) {
+    throw new Error(`Resend subscription keys send failed: ${result.error.message}`);
+  }
+  console.log(
+    `${LOG_PREFIX} sent ${totalKeys} key(s) across ${input.groups.length} product(s) to ${input.toEmail} (id=${result.data?.id})`,
+  );
+}
+
+export async function notifySupport(
+  input: SupportNotifyInput,
+  dryRun: boolean,
+): Promise<void> {
+  const from = required("RESEND_FROM");
+  const to = required("RESEND_SUPPORT_TO");
+
+  if (dryRun) {
+    console.log(`${LOG_PREFIX} DRY_RUN — would notify ${to} about ${input.customerEmail}`);
+    return;
+  }
+
+  const apiKey = required("RESEND_API_KEY");
+  const resend = new Resend(apiKey);
+
+  const text = [
+    `New trial activated:`,
+    ``,
+    `Product:        ${productLabel(input.product)}`,
+    `Name:           ${input.customerName}`,
+    `Email:          ${input.customerEmail}`,
+    `Company:        ${input.company}`,
+    `License ID:     ${input.licenseId}`,
+    `License Key:    ${input.licenseKey}`,
+    ``,
+    `Sales follow-up suggested after ~10 days of trial.`,
+  ].join("\n");
+
+  const result = await resend.emails.send({
+    from,
+    to,
+    subject: `[${productLabel(input.product)}] New trial: ${input.company}`,
+    text,
+  });
+
+  if (result.error) {
+    console.error(`${LOG_PREFIX} support notify failed: ${result.error.message}`);
+    return;
+  }
+  console.log(`${LOG_PREFIX} support notified (id=${result.data?.id})`);
+}
+
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing env var: ${name}`);
+  return value;
+}
+
+function escape(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}

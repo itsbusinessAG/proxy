@@ -1,0 +1,710 @@
+import { createAppAuth } from "@octokit/auth-app";
+import { Octokit } from "@octokit/rest";
+
+// GitHub-issues backend for the cc-tmgmt in-app feedback proxy. Authenticated as
+// the GitHub App (same credentials as the release proxy) so no static token is
+// needed — installation tokens are minted per call. The client never sees it.
+// Customer isolation
+// uses a per-license `customer:<licenseId>` label as the index — GET filters
+// issues by the validated license's own label, so a client can only ever see
+// its own reports (no separate datastore needed).
+
+const LOG_PREFIX = "[feedback]";
+// A maintainer comment starting with this sentinel is the ONLY comment content
+// ever surfaced to the customer (a deliberately released status reason).
+const CUSTOMER_VISIBLE_SENTINEL = ">>CUSTOMER:";
+// A report the customer removed from their in-tool list BEFORE #28. The GitHub
+// issue stays OPEN and otherwise untouched; GET just hides it. Kept only for
+// back-compat with reports withdrawn under the old behaviour.
+const CLIENT_HIDDEN_LABEL = "client-hidden";
+// A report the customer withdrew in the tool (#28). The issue is CLOSED as
+// not-planned and carries this label; GET hides it so it never surfaces as
+// "rejected".
+const WITHDRAWN_LABEL = "withdrawn";
+const WITHDRAWN_LABEL_COLOR = "bfbfbf";
+const WITHDRAWN_LABEL_DESCRIPTION = "Vom Kunden im Tool zurückgezogen";
+// Any of these labels means the report has left the "received" state, so the
+// customer may no longer edit or withdraw it. (client-hidden is NOT here — it
+// doesn't change the issue's workflow state.)
+const NON_RECEIVED_LABELS = [
+  "status:reviewing",
+  "status:in-progress",
+  "status:done",
+  "wontfix",
+];
+
+export type FeedbackType = "bug" | "feature";
+export type FeedbackSource = "user" | "copilot";
+export type FeedbackStatus =
+  | "received"
+  | "reviewing"
+  | "in_progress"
+  | "done"
+  | "rejected";
+
+export interface FeedbackContext {
+  version?: string;
+  platform?: string;
+  osVersion?: string;
+}
+
+export interface CreateIssueInput {
+  type: FeedbackType;
+  title: string;
+  description: string;
+  repro?: string;
+  source: FeedbackSource;
+  context: FeedbackContext;
+  // github.com blob-view URLs of screenshots already uploaded to GitHub (see
+  // screenshots.ts). Linked from a `## Screenshots` body section. Empty when none.
+  imageUrls?: string[];
+  // Server-derived from the license — never from the client.
+  company: string;
+  licenseId: string;
+}
+
+export interface CreatedIssue {
+  issueNumber: number;
+  issueId: number;
+  createdAt: string;
+}
+
+export interface FeedbackReport {
+  issueNumber: number;
+  // The customer's own issue title. Lets the client show a real title (not just
+  // "#123") for reports that reappear after a reinstall (TMT #213).
+  title: string;
+  // "bug" | "feature", from the `type:*` label. Falls back to "bug" if absent.
+  type: FeedbackType;
+  // Issue creation date (ISO), so a re-synced report keeps its original date.
+  createdAt: string;
+  // The customer's own description/repro text WITH the "[screenshot-<n>.png]"
+  // markers (screenshot links reversed), so a client that lost its local copy
+  // (reinstall / second machine) can restore the report incl. inline images
+  // (TMT#245). repro is null when the report had none.
+  description: string;
+  repro: string | null;
+  status: FeedbackStatus;
+  statusReason: string | null;
+  // App version the report was FILED against (from the `version:<version>` label
+  // set at creation). null when the issue predates the label scheme.
+  foundVersion: string | null;
+  // App version a feature/bug was shipped with (from a shipped:<version> label
+  // or the issue's milestone). null when not yet shipped.
+  deliveredVersion: string | null;
+  updatedAt: string;
+}
+
+export interface UpdateIssueInput {
+  type: FeedbackType;
+  title: string;
+  description: string;
+  repro?: string;
+  // Screenshots on edit — the client sends its FULL current set, so this replaces:
+  //   undefined     → no `images` field was sent → keep the existing section as-is
+  //   string[] (≥0) → rebuild the section from these URLs ([] removes it entirely)
+  imageUrls?: string[];
+}
+
+// A report that has passed the ownership + "received" guard and may be edited.
+export interface EditableIssue {
+  number: number;
+  state: string;
+  body: string;
+  labels: string[];
+  updatedAt: string;
+}
+
+export type EditGuard =
+  | { ok: true; issue: EditableIssue }
+  | { ok: false; status: number; reason: string };
+
+export async function createIssue(
+  input: CreateIssueInput,
+  dryRun: boolean,
+): Promise<CreatedIssue> {
+  const imageUrls = input.imageUrls ?? [];
+  const body = buildBody(
+    input.description,
+    input.repro,
+    buildScreenshotsSection(imageUrls),
+    imageUrls,
+  );
+  const labels = buildLabels(input);
+
+  if (dryRun) {
+    console.log(
+      `${LOG_PREFIX} DRY_RUN — would create ${input.type} issue "${input.title}" labels=[${labels.join(", ")}] images=${input.imageUrls?.length ?? 0}`,
+    );
+    return { issueNumber: 0, issueId: 0, createdAt: new Date().toISOString() };
+  }
+
+  const { owner, repo } = repoCoords();
+  const res = await octokit().rest.issues.create({
+    owner,
+    repo,
+    title: input.title,
+    body,
+    labels,
+  });
+  console.log(`${LOG_PREFIX} created issue #${res.data.number} for ${input.licenseId}`);
+  return {
+    issueNumber: res.data.number,
+    issueId: res.data.id,
+    createdAt: res.data.created_at,
+  };
+}
+
+export async function listCustomerIssues(
+  licenseId: string,
+  dryRun: boolean,
+): Promise<FeedbackReport[]> {
+  if (dryRun) {
+    return [
+      {
+        issueNumber: 124,
+        title: "Export schlägt bei großen Testläufen fehl",
+        type: "bug",
+        createdAt: new Date(Date.now() - 12 * 86400000).toISOString(),
+        description: "Beim Export großer Läufe [screenshot-1.png] bricht die App ab.",
+        repro: "1. Großen Lauf öffnen\n2. Export klicken",
+        status: "done",
+        statusReason: null,
+        foundVersion: "0.6.2",
+        deliveredVersion: "0.6.6",
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        issueNumber: 123,
+        title: "Dunkles Design für die Ergebnisansicht",
+        type: "feature",
+        createdAt: new Date(Date.now() - 5 * 86400000).toISOString(),
+        description: "Bitte einen Dark-Mode für die Ergebnisansicht.",
+        repro: null,
+        status: "in_progress",
+        statusReason: null,
+        foundVersion: "0.29.0",
+        deliveredVersion: null,
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        issueNumber: 120,
+        title: "Integration mit Fremdsystem X",
+        type: "feature",
+        createdAt: new Date(Date.now() - 20 * 86400000).toISOString(),
+        description: "Anbindung an System X wäre hilfreich.",
+        repro: null,
+        status: "rejected",
+        statusReason: "Außerhalb des Scopes.",
+        foundVersion: null,
+        deliveredVersion: null,
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+  }
+
+  const { owner, repo } = repoCoords();
+  const client = octokit();
+  const res = await client.rest.issues.listForRepo({
+    owner,
+    repo,
+    labels: customerLabel(licenseId),
+    state: "all",
+    per_page: 100,
+  });
+
+  const reports: FeedbackReport[] = [];
+  for (const issue of res.data) {
+    if (issue.pull_request) continue; // listForRepo also returns PRs
+    // Hide reports the customer removed/withdrew: old "client-hidden" (still
+    // open) and new "withdrawn" (closed not-planned). The latter MUST be hidden
+    // so it never shows up as "rejected" via mapStatus (#28).
+    if (isHiddenFromCustomer(labelNames(issue))) continue;
+    const status = mapStatus(issue);
+    // A released reason is only relevant once an issue is closed.
+    const statusReason =
+      issue.state === "closed"
+        ? await releasedReason(client, owner, repo, issue.number)
+        : null;
+    const { description, repro } = extractBodyFields(issue.body ?? "");
+    reports.push({
+      issueNumber: issue.number,
+      title: issue.title,
+      type: extractType(issue),
+      createdAt: issue.created_at,
+      description,
+      repro,
+      status,
+      statusReason,
+      foundVersion: extractFoundVersion(issue),
+      deliveredVersion: extractDeliveredVersion(issue),
+      updatedAt: issue.updated_at,
+    });
+  }
+  return reports;
+}
+
+// Heading for the user-provided screenshots (uploaded to GitHub by screenshots.ts).
+// Placed last in the body — after Beschreibung + Reproschritte. (The old
+// "## Automatisch erfasster Kontext" block it used to precede was removed in #3.)
+const SCREENSHOTS_HEADING = "## Screenshots";
+
+// The issue body carries only the customer's own text and, optionally, an
+// uploaded-screenshots section. Telemetry (version/platform/os) lives in
+// structured labels, and the app appends its own "## Robin-Kontext" /
+// "## System-Log" sections into the description.
+function buildBody(
+  description: string,
+  repro: string | undefined,
+  screenshotsSection?: string | null,
+  imageUrls: string[] = [],
+): string {
+  // Rewrite "[screenshot-<n>.png]" markers in the customer text into links at
+  // their position (TMT#245). The screenshots section is appended verbatim (it
+  // is already a list of links), so it must NOT be run through the linkifier.
+  const desc = linkifyScreenshotMarkers(description, imageUrls);
+  const lines: string[] = ["## Beschreibung", "", desc];
+  if (repro) {
+    lines.push("", "## Reproduktionsschritte", "", linkifyScreenshotMarkers(repro, imageUrls));
+  }
+  if (screenshotsSection) lines.push("", screenshotsSection);
+  return lines.join("\n");
+}
+
+// Markdown section for the already-uploaded screenshots. Uses plain clickable
+// links (NOT ![]() image embeds) over the github.com blob domain: for a private
+// repo an embed of a blob/raw URL renders as a broken image (camo can't load
+// private content), whereas a link opens the image reliably for repo members.
+// See Issue #5. null when none.
+function buildScreenshotsSection(imageUrls: string[]): string | null {
+  if (imageUrls.length === 0) return null;
+  const items = imageUrls.map((url, i) => {
+    const ext = url.split("?")[0].split(".").pop() || "png";
+    return `- [screenshot-${i + 1}.${ext}](${url})`;
+  });
+  return [SCREENSHOTS_HEADING, "", ...items].join("\n");
+}
+
+// Body section headings buildBody emits. Used to slice description/repro back
+// out on read. The customer text may itself contain "## " sub-sections (the app
+// appends "## Robin-Kontext"/"## System-Log" into the description), so we split
+// ONLY on these known headings, never on any "## " line.
+const DESCRIPTION_HEADING = "## Beschreibung";
+const REPRO_HEADING = "## Reproduktionsschritte";
+
+// The ordered blob-view URLs of the existing "## Screenshots" section, in list
+// order (screenshot-1 first). [] when there is no section. Used on edit to
+// re-link the re-sent description markers when the image set is unchanged.
+export function extractScreenshotUrls(body: string): string[] {
+  const start = body.indexOf(SCREENSHOTS_HEADING);
+  if (start < 0) return [];
+  const rest = body.slice(start);
+  const next = rest.indexOf("\n## ", SCREENSHOTS_HEADING.length);
+  const section = next >= 0 ? rest.slice(0, next) : rest;
+  const urls: string[] = [];
+  const re = /^- \[[^\]]+\]\(([^)]+)\)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(section))) urls.push(m[1]);
+  return urls;
+}
+
+// Screenshot marker "[screenshot-<n>.<ext>]" that is NOT already followed by a
+// "(" (so linkify is idempotent). Only the auto-named screenshot markers map
+// positionally to the uploaded images; markers with any other filename are left
+// untouched.
+const SCREENSHOT_MARKER_RE = /\[screenshot-(\d+)\.(?:png|jpe?g|webp)\](?!\()/gi;
+// A screenshot marker that already carries a "(url)" link — for the reverse.
+const SCREENSHOT_LINK_RE =
+  /(\[screenshot-(\d+)\.(?:png|jpe?g|webp)\])\([^)\s]*\)/gi;
+
+/**
+ * Replace each "[screenshot-<n>.png]" marker in the text with a clickable link
+ * "[screenshot-<n>.png](<url>)" at the same spot, mapping marker n → urls[n-1].
+ * Markers without a matching upload (or with a different filename) are left as
+ * plain text. The marker text is preserved verbatim so the rewrite is reversible.
+ */
+export function linkifyScreenshotMarkers(text: string, urls: string[]): string {
+  return text.replace(SCREENSHOT_MARKER_RE, (marker, n: string) => {
+    const url = urls[Number(n) - 1];
+    return url ? `${marker}(${url})` : marker;
+  });
+}
+
+/**
+ * Inverse of linkifyScreenshotMarkers: turn "[screenshot-<n>.png](<url>)" back
+ * into the plain "[screenshot-<n>.png]" marker, so a client reading the text can
+ * re-map the images inline. Non-screenshot links are untouched.
+ */
+export function stripScreenshotLinks(text: string): string {
+  return text.replace(SCREENSHOT_LINK_RE, "$1");
+}
+
+// Slice out the text between `startHeading` and the first of `endHeadings`
+// (or EOF). Only the known buildBody headings are used as boundaries.
+function sectionBetween(
+  body: string,
+  startHeading: string,
+  endHeadings: string[],
+): string | null {
+  const s = body.indexOf(startHeading);
+  if (s < 0) return null;
+  const from = s + startHeading.length;
+  let end = body.length;
+  for (const h of endHeadings) {
+    const i = body.indexOf("\n" + h, from);
+    if (i >= 0 && i < end) end = i;
+  }
+  return body.slice(from, end).trim();
+}
+
+/**
+ * Read the customer's original description/repro back out of an issue body, with
+ * the screenshot links turned back into "[screenshot-<n>.png]" markers so the
+ * client can restore the inline images. repro is null when the report had none.
+ */
+export function extractBodyFields(body: string): {
+  description: string;
+  repro: string | null;
+} {
+  const desc = sectionBetween(body, DESCRIPTION_HEADING, [
+    REPRO_HEADING,
+    SCREENSHOTS_HEADING,
+  ]);
+  const repro = sectionBetween(body, REPRO_HEADING, [SCREENSHOTS_HEADING]);
+  return {
+    // Legacy issues without our headings: fall back to the whole (stripped) body.
+    description: stripScreenshotLinks(desc ?? body).trim(),
+    repro: repro ? stripScreenshotLinks(repro) : null,
+  };
+}
+
+/**
+ * Fetch an issue and enforce that it belongs to this license and is still in the
+ * `received` state — the only state in which a customer may edit or withdraw it.
+ * Client-side visibility is not security: the server enforces ownership + state.
+ */
+export async function loadEditableIssue(
+  licenseId: string,
+  issueNumber: number,
+  dryRun: boolean,
+): Promise<EditGuard> {
+  if (dryRun) {
+    return {
+      ok: true,
+      issue: {
+        number: issueNumber,
+        state: "open",
+        body: `## Beschreibung\n\nDry run`,
+        labels: [customerLabel(licenseId), "type:bug", "version:0.6.2"],
+        updatedAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  const { owner, repo } = repoCoords();
+  let data;
+  try {
+    const res = await octokit().rest.issues.get({
+      owner,
+      repo,
+      issue_number: issueNumber,
+    });
+    data = res.data;
+  } catch (err) {
+    if (isNotFound(err)) return { ok: false, status: 404, reason: "Report not found" };
+    throw err;
+  }
+
+  if (data.pull_request) return { ok: false, status: 404, reason: "Report not found" };
+
+  const labels = labelNames(data);
+  if (!labels.includes(customerLabel(licenseId))) {
+    return { ok: false, status: 403, reason: "Not your report" };
+  }
+  if (!isReceived(data.state, labels)) {
+    return {
+      ok: false,
+      status: 409,
+      reason: "Report can no longer be edited or withdrawn",
+    };
+  }
+
+  return {
+    ok: true,
+    issue: {
+      number: data.number,
+      state: data.state,
+      body: data.body ?? "",
+      labels,
+      updatedAt: data.updated_at,
+    },
+  };
+}
+
+export async function updateIssue(
+  issue: EditableIssue,
+  input: UpdateIssueInput,
+  dryRun: boolean,
+): Promise<{ updatedAt: string }> {
+  // Effective image set: the client's new set, or — when it sent no `images`
+  // field (undefined ⇒ keep existing) — the URLs parsed back out of the current
+  // "## Screenshots" section. [] ⇒ explicit clear. These same URLs both rebuild
+  // the section and re-link the re-sent description/repro markers.
+  const effectiveUrls =
+    input.imageUrls === undefined
+      ? extractScreenshotUrls(issue.body)
+      : input.imageUrls;
+  const screenshotsSection = buildScreenshotsSection(effectiveUrls);
+  const body = buildBody(
+    input.description,
+    input.repro,
+    screenshotsSection,
+    effectiveUrls,
+  );
+  // Swap the type:* label; keep everything else (customer/company/source and the
+  // version/platform/os telemetry labels — the client never resends telemetry on
+  // edit, so the labels set at creation are preserved as-is).
+  const labels = issue.labels
+    .filter((l) => !l.startsWith("type:"))
+    .concat(`type:${input.type}`);
+
+  if (dryRun) {
+    console.log(`${LOG_PREFIX} DRY_RUN — would update issue #${issue.number}`);
+    return { updatedAt: new Date().toISOString() };
+  }
+
+  const { owner, repo } = repoCoords();
+  const res = await octokit().rest.issues.update({
+    owner,
+    repo,
+    issue_number: issue.number,
+    title: input.title,
+    body,
+    labels,
+  });
+  return { updatedAt: res.data.updated_at };
+}
+
+/** True for a report the customer removed (old) or withdrew (new) — hidden from GET. */
+export function isHiddenFromCustomer(labels: string[]): boolean {
+  return labels.includes(CLIENT_HIDDEN_LABEL) || labels.includes(WITHDRAWN_LABEL);
+}
+
+// Ensure the `withdrawn` label exists with the intended colour/description,
+// creating it on first use. A 422 means it already exists → fine.
+async function ensureWithdrawnLabel(
+  client: Octokit,
+  owner: string,
+  repo: string,
+): Promise<void> {
+  try {
+    await client.rest.issues.createLabel({
+      owner,
+      repo,
+      name: WITHDRAWN_LABEL,
+      color: WITHDRAWN_LABEL_COLOR,
+      description: WITHDRAWN_LABEL_DESCRIPTION,
+    });
+  } catch (err) {
+    if ((err as { status?: number })?.status !== 422) throw err;
+  }
+}
+
+export async function withdrawIssue(
+  issue: EditableIssue,
+  dryRun: boolean,
+): Promise<void> {
+  if (dryRun) {
+    console.log(
+      `${LOG_PREFIX} DRY_RUN — would label #${issue.number} '${WITHDRAWN_LABEL}' and close it (not planned)`,
+    );
+    return;
+  }
+  // Withdraw = mark + close (#28). Order matters: LABEL FIRST, then close. A
+  // closed issue that missed the label would surface to the customer as
+  // "rejected" (closed not-planned → mapStatus), so we never close before the
+  // label is on. If the close then fails, the route returns 502 and the client
+  // keeps the report; a retry finds it still `received` (open) and completes.
+  const { owner, repo } = repoCoords();
+  const client = octokit();
+
+  await ensureWithdrawnLabel(client, owner, repo);
+  await client.rest.issues.addLabels({
+    owner,
+    repo,
+    issue_number: issue.number,
+    labels: [WITHDRAWN_LABEL],
+  });
+  await client.rest.issues.update({
+    owner,
+    repo,
+    issue_number: issue.number,
+    state: "closed",
+    state_reason: "not_planned",
+  });
+
+  // Best-effort audit trail — non-fatal (the withdraw already succeeded).
+  try {
+    await client.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: issue.number,
+      body: `Vom Kunden im Tool zurückgezogen (${new Date().toISOString()}).`,
+    });
+  } catch (err) {
+    console.error(`${LOG_PREFIX} withdraw audit comment failed (non-fatal)`, err);
+  }
+}
+
+function buildLabels(input: CreateIssueInput): string[] {
+  // customer:<licenseId> is the unique, stable isolation index used by GET.
+  // company:<name> is added purely so humans can see the customer in the issue
+  // list (private repo). GET never filters by the company label, so a comma or
+  // a duplicate company name in it is harmless.
+  const labels = [`type:${input.type}`, customerLabel(input.licenseId)];
+  if (input.company) labels.push(`company:${companyLabel(input.company)}`);
+  if (input.source === "copilot") labels.push("source:copilot");
+  // Structured, filterable telemetry (replaces the old free-text body block).
+  const c = input.context ?? {};
+  if (c.version) labels.push(`version:${labelValue(c.version)}`);
+  if (c.platform) labels.push(`platform:${labelValue(c.platform)}`);
+  if (c.osVersion) labels.push(`os:${labelValue(c.osVersion)}`);
+  return labels;
+}
+
+function customerLabel(licenseId: string): string {
+  return `customer:${licenseId}`;
+}
+
+function companyLabel(name: string): string {
+  // GitHub label names cap at 50 chars; "company:" already uses 8.
+  return name.trim().slice(0, 40);
+}
+
+// Keep a telemetry label single-line and within GitHub's 50-char label cap
+// (longest prefix here is "platform:" at 9 chars, so 40 leaves headroom).
+function labelValue(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 40);
+}
+
+interface IssueLike {
+  state: string;
+  state_reason?: string | null;
+  labels: (string | { name?: string })[];
+}
+
+function labelNames(issue: {
+  labels: (string | { name?: string })[];
+}): string[] {
+  return issue.labels
+    .map((l) => (typeof l === "string" ? l : l.name))
+    .filter((n): n is string => Boolean(n));
+}
+
+function isReceived(state: string, labels: string[]): boolean {
+  return state === "open" && !labels.some((l) => NON_RECEIVED_LABELS.includes(l));
+}
+
+// Report type from the `type:*` label. Defaults to "bug" when the label is
+// missing (older issues) so the client always gets a valid value.
+function extractType(issue: {
+  labels: (string | { name?: string })[];
+}): FeedbackType {
+  return labelNames(issue).includes("type:feature") ? "feature" : "bug";
+}
+
+// Version the report was filed against, from the `version:<version>` label set
+// at creation. null for issues that predate the label scheme.
+function extractFoundVersion(issue: {
+  labels: (string | { name?: string })[];
+}): string | null {
+  const found = labelNames(issue).find((l) => l.startsWith("version:"));
+  return found ? found.slice("version:".length).trim() || null : null;
+}
+
+// Delivered app version: a `shipped:<version>` label wins; otherwise the issue's
+// milestone title (the team's chosen index). null when neither is set.
+function extractDeliveredVersion(issue: {
+  labels: (string | { name?: string })[];
+  milestone?: { title?: string } | null;
+}): string | null {
+  const shipped = labelNames(issue).find((l) => l.startsWith("shipped:"));
+  if (shipped) {
+    return shipped.slice("shipped:".length).trim() || null;
+  }
+  const milestone = issue.milestone?.title?.trim();
+  return milestone || null;
+}
+
+function isNotFound(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "status" in err &&
+    (err as { status?: number }).status === 404
+  );
+}
+
+function mapStatus(issue: IssueLike): FeedbackStatus {
+  const labels = labelNames(issue);
+
+  if (issue.state === "open") {
+    if (labels.includes("status:in-progress")) return "in_progress";
+    if (labels.includes("status:reviewing")) return "reviewing";
+    return "received";
+  }
+  // closed
+  if (issue.state_reason === "not_planned" || labels.includes("wontfix")) {
+    return "rejected";
+  }
+  return "done";
+}
+
+async function releasedReason(
+  client: Octokit,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+): Promise<string | null> {
+  const res = await client.rest.issues.listComments({
+    owner,
+    repo,
+    issue_number: issueNumber,
+    per_page: 100,
+  });
+  const marked = res.data
+    .map((c) => c.body ?? "")
+    .filter((b) => b.trimStart().startsWith(CUSTOMER_VISIBLE_SENTINEL));
+  if (marked.length === 0) return null;
+  const last = marked[marked.length - 1];
+  return last.trimStart().slice(CUSTOMER_VISIBLE_SENTINEL.length).trim() || null;
+}
+
+// Exported so the screenshots uploader shares the same GitHub App auth + repo.
+export function octokit(): Octokit {
+  const appId = required("GH_APP_ID");
+  const installationId = required("GH_APP_INSTALLATION_ID");
+  const privateKey = required("GH_APP_PRIVATE_KEY").replace(/\\n/g, "\n");
+  return new Octokit({
+    authStrategy: createAppAuth,
+    auth: {
+      appId: Number(appId),
+      privateKey,
+      installationId: Number(installationId),
+    },
+  });
+}
+
+export function repoCoords(): { owner: string; repo: string } {
+  const [owner, repo] = required("FEEDBACK_REPO").split("/");
+  if (!owner || !repo) {
+    throw new Error("FEEDBACK_REPO must be in the form owner/repo");
+  }
+  return { owner, repo };
+}
+
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing env var: ${name}`);
+  return value;
+}

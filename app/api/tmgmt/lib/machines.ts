@@ -1,0 +1,642 @@
+import { validateKey, type KeygenValidation } from "./entitlement";
+import { coerceProduct } from "../../../products";
+
+// Device/seat binding via Keygen machine activation (#29). One key = one device:
+// each license carries maxMachines=1 and the trial policy uses
+// machineUniquenessStrategy=UNIQUE_PER_PRODUCT, so a device that already ran a
+// trial cannot activate a second trial of the same product (a new key won't bind
+// → won't run). Those policy settings live in Keygen, not here; this module only
+// activates/lists/frees machines and maps Keygen's verdicts to stable reasons.
+//
+// Machine operations use the server-side admin token; the client only ever sends
+// its own license key (Bearer) + a device fingerprint.
+
+const LOG_PREFIX = "[license][machines]";
+const KEYGEN = "https://api.keygen.sh/v1/accounts";
+
+// Unscoped validate-key codes that mean "the license itself is fine, it just has
+// no active machine yet" (machine-scoped policies report these) → proceed to
+// activate rather than treating the license as invalid.
+const NEEDS_ACTIVATION_CODES = [
+  "NO_MACHINE",
+  "NO_MACHINES",
+  "FINGERPRINT_SCOPE_MISMATCH",
+  "FINGERPRINT_SCOPE_REQUIRED",
+  "TOO_MANY_MACHINES",
+];
+
+export type ActivateReason =
+  | "invalid"
+  | "expired"
+  | "suspended"
+  | "seat-limit"
+  | "device-already-registered"
+  | "unavailable";
+
+export type ActivateResult =
+  | {
+      ok: true;
+      status: "already-active" | "activated";
+      machineId: string;
+      limit: number | null;
+      used: number;
+    }
+  | {
+      ok: false;
+      status: number;
+      reason: ActivateReason;
+      message: string;
+      limit?: number | null;
+      used?: number;
+    };
+
+export interface DeviceInfo {
+  id: string;
+  fingerprint: string | null;
+  name: string | null; // human label, e.g. the PC name the app sends
+  platform: string | null;
+  createdAt: string | null;
+}
+
+// Optional device details the app may send with an activation, stored on the
+// Keygen machine so "your devices" lists can show which PC a license is on.
+export interface DeviceMeta {
+  name?: string; // e.g. hostname / PC name
+  platform?: string; // e.g. "win32", "darwin"
+}
+
+export type MachinesResult =
+  | { ok: true; devices: DeviceInfo[]; limit: number | null }
+  | { ok: false; status: number; reason: ActivateReason; message: string };
+
+export type DeactivateResult =
+  | { ok: true }
+  | { ok: false; status: number; reason: "invalid" | "not-found" | "forbidden" | "unavailable"; message: string };
+
+export type HeartbeatResult =
+  | { ok: true; heartbeatDuration: number | null }
+  | { ok: false; status: number; reason: "invalid" | "not-found" | "forbidden" | "unavailable"; message: string };
+
+// --- public API -------------------------------------------------------------
+
+export async function activateDevice(
+  licenseKey: string,
+  fingerprint: string,
+  dryRun: boolean,
+  device: DeviceMeta = {},
+): Promise<ActivateResult> {
+  if (!licenseKey) return fail(401, "invalid", "Missing license key");
+  if (!fingerprint) return fail(400, "invalid", "Missing device fingerprint");
+
+  if (dryRun) {
+    // Simulate the seat-limit / already-registered / takeover branches for tests.
+    if (fingerprint === "DRYRUN_SEATFULL") return fail(403, "seat-limit", "Seat limit reached", 1, 1);
+    if (fingerprint === "DRYRUN_TAKEN") return fail(403, "device-already-registered", "Device already registered");
+    if (fingerprint === "DRYRUN_TAKEOVER") {
+      return { ok: true, status: "activated", machineId: "dry-run-machine-takeover", limit: 1, used: 1 };
+    }
+    return { ok: true, status: "activated", machineId: "dry-run-machine", limit: 1, used: 1 };
+  }
+
+  const body = await validateKey(licenseKey);
+  if (!body) return fail(502, "unavailable", "License validation unavailable");
+
+  const base = classifyBaseValidity(body);
+  if (base) return base; // hard stop: expired / suspended / invalid
+
+  const licenseId = body?.data?.id ?? "";
+  if (!licenseId) return fail(401, "invalid", "Invalid license key");
+  const limit = await getPolicyMaxMachines(policyIdOf(body));
+
+  // Already activated for this device? (idempotent — reinstall / restart)
+  let machines: DeviceInfo[];
+  try {
+    machines = await listMachinesByLicense(licenseId);
+  } catch (e) {
+    console.error(`${LOG_PREFIX} list machines failed`, e);
+    return fail(502, "unavailable", "Could not read device activations");
+  }
+  const existing = machines.find((m) => m.fingerprint === fingerprint);
+  if (existing) {
+    // Keep the stored PC name / platform current if the app now reports a
+    // different one (e.g. the machine was renamed). Best-effort, non-fatal.
+    const patch = machineMetaPatch(existing, device);
+    if (Object.keys(patch).length > 0) await updateMachine(existing.id, patch);
+    return { ok: true, status: "already-active", machineId: existing.id, limit, used: machines.length };
+  }
+
+  // New device → let Keygen enforce maxMachines + fingerprint uniqueness.
+  const create = await createMachine(licenseId, fingerprint, device);
+  if (create.status === 201 && create.machineId) {
+    return { ok: true, status: "activated", machineId: create.machineId, limit, used: machines.length + 1 };
+  }
+  const reason = classifyCreateConflict(create.status, create.codes);
+  if (reason === "seat-limit") {
+    return fail(403, "seat-limit", "Seat limit reached for this license", limit, machines.length);
+  }
+  if (reason === "device-already-registered") {
+    // The fingerprint is bound to another license of this product. If THIS is a
+    // paid license and the conflict is the SAME customer's own (typically their
+    // expired trial), take the device over: free the old machine and re-activate.
+    // Trial→trial re-registration is NOT taken over (anti-abuse stays intact).
+    const tookOver = await attemptTakeover(body, fingerprint, licenseId);
+    if (tookOver) {
+      const retry = await createMachine(licenseId, fingerprint, device);
+      if (retry.status === 201 && retry.machineId) {
+        return { ok: true, status: "activated", machineId: retry.machineId, limit, used: machines.length + 1 };
+      }
+      console.error(`${LOG_PREFIX} re-activation after takeover failed (HTTP ${retry.status})`, retry.codes);
+    }
+    return fail(403, "device-already-registered", "This device is already registered to a license");
+  }
+  console.error(`${LOG_PREFIX} activation failed (HTTP ${create.status})`, create.codes);
+  return fail(502, "unavailable", "Could not activate this device");
+}
+
+export async function listDevices(licenseKey: string, dryRun: boolean): Promise<MachinesResult> {
+  if (!licenseKey) return { ok: false, status: 401, reason: "invalid", message: "Missing license key" };
+  if (dryRun) {
+    return {
+      ok: true,
+      limit: 1,
+      devices: [
+        {
+          id: "dry-run-machine",
+          fingerprint: "dryrun-fp",
+          name: "Dry Run PC",
+          platform: "win32",
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    };
+  }
+
+  const body = await validateKey(licenseKey);
+  if (!body) return { ok: false, status: 502, reason: "unavailable", message: "License validation unavailable" };
+  const base = classifyBaseValidity(body);
+  if (base) return { ok: false, status: base.status, reason: base.reason, message: base.message };
+
+  const licenseId = body?.data?.id ?? "";
+  if (!licenseId) return { ok: false, status: 401, reason: "invalid", message: "Invalid license key" };
+  try {
+    const devices = await listMachinesByLicense(licenseId);
+    return { ok: true, devices, limit: await getPolicyMaxMachines(policyIdOf(body)) };
+  } catch (e) {
+    console.error(`${LOG_PREFIX} list machines failed`, e);
+    return { ok: false, status: 502, reason: "unavailable", message: "Could not read device activations" };
+  }
+}
+
+export async function deactivateDevice(
+  licenseKey: string,
+  machineId: string,
+  dryRun: boolean,
+): Promise<DeactivateResult> {
+  if (!licenseKey) return { ok: false, status: 401, reason: "invalid", message: "Missing license key" };
+  if (dryRun) return { ok: true };
+
+  const body = await validateKey(licenseKey);
+  if (!body) return { ok: false, status: 502, reason: "unavailable", message: "License validation unavailable" };
+  const base = classifyBaseValidity(body);
+  // For deactivation we don't care about expiry — a customer must be able to free
+  // a seat from an expired license too. Only a hard-invalid key is rejected.
+  if (base && base.reason === "invalid") {
+    return { ok: false, status: 401, reason: "invalid", message: "Invalid license key" };
+  }
+  const licenseId = body?.data?.id ?? "";
+  if (!licenseId) return { ok: false, status: 401, reason: "invalid", message: "Invalid license key" };
+
+  // Ownership: the machine must belong to THIS license (never delete another
+  // customer's device).
+  const owner = await machineLicenseId(machineId);
+  if (owner === null) return { ok: false, status: 404, reason: "not-found", message: "Device not found" };
+  if (owner !== licenseId) return { ok: false, status: 403, reason: "forbidden", message: "Not your device" };
+
+  const res = await fetch(`${KEYGEN}/${accountId()}/machines/${encodeURIComponent(machineId)}`, {
+    method: "DELETE",
+    headers: adminHeaders(),
+  });
+  if (!res.ok && res.status !== 404) {
+    console.error(`${LOG_PREFIX} delete machine ${machineId} failed HTTP ${res.status}`);
+    return { ok: false, status: 502, reason: "unavailable", message: "Could not free the device" };
+  }
+  return { ok: true };
+}
+
+// Extend a run's floating lease (#47, framework concurrency). The framework pings
+// periodically so Keygen keeps the machine (lease) alive; a crashed run stops
+// pinging and Keygen auto-culls it after heartbeatDuration, freeing the seat
+// (see docs/license-concurrency.md). Bearer-scoped + ownership-checked (the
+// machine must belong to THIS license). Like DELETE, only a hard-invalid key is
+// rejected — a heartbeat just extends an EXISTING lease; concurrency/entitlement
+// is enforced at activate + validate-key, not here.
+//
+// A real "lease gone" verdict ALWAYS returns status 404 (so the route emits a
+// JSON `reason`), which the framework runtime uses to tell a culled lease apart
+// from a missing-route 404 (endpoint not deployed).
+export async function pingHeartbeat(
+  licenseKey: string,
+  machineId: string,
+  dryRun: boolean,
+): Promise<HeartbeatResult> {
+  if (!licenseKey) return { ok: false, status: 401, reason: "invalid", message: "Missing license key" };
+  if (!machineId) return { ok: false, status: 404, reason: "not-found", message: "Device not found" };
+
+  if (dryRun) {
+    // Magic machine ids let the framework tests hit the real endpoint without
+    // consuming a seat (mirrors activate's DRYRUN_* fingerprints).
+    if (machineId === "DRYRUN_GONE") {
+      return { ok: false, status: 404, reason: "not-found", message: "Lease no longer exists" };
+    }
+    if (machineId === "DRYRUN_FORBIDDEN") {
+      return { ok: false, status: 403, reason: "forbidden", message: "Not your device" };
+    }
+    return { ok: true, heartbeatDuration: 120 };
+  }
+
+  const body = await validateKey(licenseKey);
+  if (!body) return { ok: false, status: 502, reason: "unavailable", message: "License validation unavailable" };
+  const base = classifyBaseValidity(body);
+  if (base && base.reason === "invalid") {
+    return { ok: false, status: 401, reason: "invalid", message: "Invalid license key" };
+  }
+  const licenseId = body?.data?.id ?? "";
+  if (!licenseId) return { ok: false, status: 401, reason: "invalid", message: "Invalid license key" };
+
+  // Ownership — also the primary "lease gone" path (a culled machine 404s here).
+  let owner: string | null;
+  try {
+    owner = await machineLicenseId(machineId);
+  } catch (e) {
+    console.error(`${LOG_PREFIX} heartbeat: read machine ${machineId} failed`, e);
+    return { ok: false, status: 502, reason: "unavailable", message: "Could not read the device lease" };
+  }
+  if (owner === null) return { ok: false, status: 404, reason: "not-found", message: "Lease no longer exists" };
+  if (owner !== licenseId) return { ok: false, status: 403, reason: "forbidden", message: "Not your device" };
+
+  const res = await fetch(
+    `${KEYGEN}/${accountId()}/machines/${encodeURIComponent(machineId)}/actions/ping-heartbeat`,
+    { method: "POST", headers: adminHeaders() },
+  );
+  if (res.ok) {
+    const b = await res.json().catch(() => null);
+    const hb = b?.data?.attributes?.heartbeatDuration;
+    return { ok: true, heartbeatDuration: typeof hb === "number" ? hb : null };
+  }
+  if (res.status === 404) {
+    return { ok: false, status: 404, reason: "not-found", message: "Lease no longer exists" };
+  }
+  // A dead heartbeat can come back as 422 — treat it as a gone lease too (→404).
+  const errBody = await res.json().catch(() => null);
+  const codes = extractErrorCodes(errBody).map((c) => c.toUpperCase());
+  if (res.status === 422 && codes.some((c) => c.includes("HEARTBEAT") || c.includes("DEAD"))) {
+    return { ok: false, status: 404, reason: "not-found", message: "Lease is dead" };
+  }
+  console.error(`${LOG_PREFIX} heartbeat ping ${machineId} failed HTTP ${res.status}`, codes);
+  return { ok: false, status: 502, reason: "unavailable", message: "Could not extend the lease" };
+}
+
+// --- Keygen plumbing --------------------------------------------------------
+
+async function listMachinesByLicense(licenseId: string): Promise<DeviceInfo[]> {
+  const res = await fetch(
+    `${KEYGEN}/${accountId()}/machines?limit=100&license=${encodeURIComponent(licenseId)}`,
+    { headers: adminHeaders() },
+  );
+  if (!res.ok) throw new Error(`Keygen list machines HTTP ${res.status}`);
+  const body = await res.json();
+  const data: unknown[] = Array.isArray(body?.data) ? body.data : [];
+  const out: DeviceInfo[] = [];
+  for (const entry of data) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const m = entry as { id?: string; attributes?: Record<string, unknown> };
+    if (!m.id) continue;
+    out.push({
+      id: m.id,
+      fingerprint: asStringOrNull(m.attributes?.fingerprint),
+      name: asStringOrNull(m.attributes?.name),
+      platform: asStringOrNull(m.attributes?.platform),
+      createdAt: asStringOrNull(m.attributes?.created),
+    });
+  }
+  return out;
+}
+
+async function createMachine(
+  licenseId: string,
+  fingerprint: string,
+  device: DeviceMeta = {},
+): Promise<{ status: number; machineId?: string; codes: string[] }> {
+  const attributes: Record<string, unknown> = { fingerprint };
+  if (device.name) attributes.name = device.name;
+  if (device.platform) attributes.platform = device.platform;
+  const res = await fetch(`${KEYGEN}/${accountId()}/machines`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: JSON.stringify({
+      data: {
+        type: "machines",
+        attributes,
+        relationships: { license: { data: { type: "licenses", id: licenseId } } },
+      },
+    }),
+  });
+  if (res.status === 201) {
+    const body = await res.json().catch(() => null);
+    return { status: 201, machineId: body?.data?.id, codes: [] };
+  }
+  const body = await res.json().catch(() => null);
+  const codes = extractErrorCodes(body);
+  return { status: res.status, codes };
+}
+
+// --- trial → paid takeover --------------------------------------------------
+
+export interface LicenseIdentity {
+  email: string | null; // normalized (trim + lowercase)
+  product: string | null; // metadata.product set by our provisioning
+  isPaid: boolean; // tied to a Stripe subscription / created as a paid seat
+}
+
+/** The identity of a license from a validate-key body (current activation). */
+export function licenseIdentity(body: KeygenValidation): LicenseIdentity {
+  const md = body?.data?.attributes?.metadata ?? {};
+  const policy = extractPolicyRef(body);
+  return {
+    email: normalizeEmail(md.email),
+    // Product from our own metadata, else resolved from the policy (licenses
+    // created straight off a product policy carry no metadata.product).
+    // Canonicalize so legacy metadata (cc-tmgmt) and policy-resolved (TMT) match
+    // in canTakeover (#43).
+    product: coerceProduct(md.product) ?? productFromPolicy(policy),
+    // Paid when tied to a Stripe subscription, created as a paid seat, OR simply
+    // sitting on a paid policy (a license created directly off the paid policy
+    // has neither subscriptionId nor kind).
+    isPaid:
+      asStringOrNull(md.subscriptionId) !== null ||
+      md.kind === "paid" ||
+      isPaidPolicy(policy),
+  };
+}
+
+// Policy id (from relationships) + name (sideloaded via ?include=policy).
+function extractPolicyRef(body: KeygenValidation): { id: string | null; name: string | null } {
+  const id = body?.data?.relationships?.policy?.data?.id ?? null;
+  let name: string | null = null;
+  if (id && Array.isArray(body.included)) {
+    const p = body.included.find((x) => x?.type === "policies" && x.id === id);
+    if (p && typeof p.attributes?.name === "string") name = p.attributes.name;
+  }
+  return { id, name };
+}
+
+function productFromPolicy(policy: { id: string | null; name: string | null }): string | null {
+  const framework = [process.env.KEYGEN_TRIAL_POLICY_ID, process.env.KEYGEN_PAID_POLICY_ID];
+  const tmgmt = [process.env.KEYGEN_TMGMT_TRIAL_POLICY_ID, process.env.KEYGEN_TMGMT_PAID_POLICY_ID];
+  if (policy.id && framework.includes(policy.id)) return "FW";
+  if (policy.id && tmgmt.includes(policy.id)) return "TMT";
+  // Name fallback: canonical FW-* / TMT-* (post-rename) OR legacy cc-* names.
+  const name = (policy.name ?? "").toLowerCase();
+  if (name.startsWith("tmt") || name.includes("cc-tmgmt")) return "TMT";
+  if (name.startsWith("fw") || name.includes("cc-testframework")) return "FW";
+  return null;
+}
+
+function isPaidPolicy(policy: { id: string | null; name: string | null }): boolean {
+  const paidIds = [process.env.KEYGEN_PAID_POLICY_ID, process.env.KEYGEN_TMGMT_PAID_POLICY_ID];
+  if (policy.id && paidIds.includes(policy.id)) return true;
+  return (policy.name ?? "").toLowerCase().includes("paid");
+}
+
+/**
+ * Whether `current` may take the device over from the `conflict` license.
+ * ONLY when the current (activating) license is PAID and it is the SAME customer
+ * (email) and SAME product — so a trial→trial re-registration is never taken over
+ * and another customer's device is never touched.
+ */
+export function canTakeover(current: LicenseIdentity, conflict: LicenseIdentity): boolean {
+  return (
+    current.isPaid &&
+    current.email !== null &&
+    conflict.email !== null &&
+    current.email === conflict.email &&
+    current.product !== null &&
+    current.product === conflict.product
+  );
+}
+
+// On a fingerprint conflict, free the same-customer machines holding it so the
+// (paid) license can re-activate. Returns true if at least one was freed.
+async function attemptTakeover(
+  body: KeygenValidation,
+  fingerprint: string,
+  currentLicenseId: string,
+): Promise<boolean> {
+  const current = licenseIdentity(body);
+  if (!current.isPaid || current.email === null) return false; // trials never take over
+
+  let conflicts: { id: string; licenseId: string | null }[];
+  try {
+    conflicts = await listMachinesByFingerprint(fingerprint);
+  } catch (e) {
+    console.error(`${LOG_PREFIX} takeover: list by fingerprint failed`, e);
+    return false;
+  }
+
+  let freed = false;
+  for (const c of conflicts) {
+    if (!c.licenseId || c.licenseId === currentLicenseId) continue;
+    let other: LicenseIdentity;
+    try {
+      other = await getLicenseIdentity(c.licenseId);
+    } catch (e) {
+      console.error(`${LOG_PREFIX} takeover: read license ${c.licenseId} failed`, e);
+      continue;
+    }
+    if (!canTakeover(current, other)) continue;
+    const res = await fetch(`${KEYGEN}/${accountId()}/machines/${encodeURIComponent(c.id)}`, {
+      method: "DELETE",
+      headers: adminHeaders(),
+    });
+    if (res.ok || res.status === 404) {
+      console.log(`${LOG_PREFIX} takeover: freed machine ${c.id} from license ${c.licenseId}`);
+      freed = true;
+    } else {
+      console.error(`${LOG_PREFIX} takeover: delete machine ${c.id} HTTP ${res.status}`);
+    }
+  }
+  return freed;
+}
+
+async function listMachinesByFingerprint(
+  fingerprint: string,
+): Promise<{ id: string; licenseId: string | null }[]> {
+  const res = await fetch(
+    `${KEYGEN}/${accountId()}/machines?limit=100&fingerprint=${encodeURIComponent(fingerprint)}`,
+    { headers: adminHeaders() },
+  );
+  if (!res.ok) throw new Error(`Keygen list machines by fingerprint HTTP ${res.status}`);
+  const body = await res.json();
+  const data: unknown[] = Array.isArray(body?.data) ? body.data : [];
+  const out: { id: string; licenseId: string | null }[] = [];
+  for (const entry of data) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const m = entry as { id?: string; relationships?: { license?: { data?: { id?: string } | null } } };
+    if (!m.id) continue;
+    out.push({ id: m.id, licenseId: m.relationships?.license?.data?.id ?? null });
+  }
+  return out;
+}
+
+async function getLicenseIdentity(licenseId: string): Promise<LicenseIdentity> {
+  // include=policy so product can be resolved from the policy when the license
+  // carries no metadata.product (e.g. hand-created in Keygen).
+  const res = await fetch(
+    `${KEYGEN}/${accountId()}/licenses/${encodeURIComponent(licenseId)}?include=policy`,
+    { headers: adminHeaders() },
+  );
+  if (!res.ok) throw new Error(`Keygen get license ${licenseId} HTTP ${res.status}`);
+  const body = (await res.json()) as KeygenValidation;
+  // getLicenseIdentity describes a CONFLICTING license; canTakeover only reads its
+  // email + product (never its isPaid), so isPaid here is informational.
+  return licenseIdentity(body);
+}
+
+function normalizeEmail(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : null;
+}
+
+/** The attributes to PATCH on a known machine when the app reports a new
+ * name/platform. Only changed, non-empty fields are included. */
+export function machineMetaPatch(existing: DeviceInfo, device: DeviceMeta): Record<string, string> {
+  const patch: Record<string, string> = {};
+  if (device.name && device.name !== existing.name) patch.name = device.name;
+  if (device.platform && device.platform !== existing.platform) patch.platform = device.platform;
+  return patch;
+}
+
+async function updateMachine(machineId: string, attributes: Record<string, string>): Promise<void> {
+  try {
+    const res = await fetch(`${KEYGEN}/${accountId()}/machines/${encodeURIComponent(machineId)}`, {
+      method: "PATCH",
+      headers: adminHeaders(),
+      body: JSON.stringify({ data: { type: "machines", id: machineId, attributes } }),
+    });
+    if (!res.ok) console.error(`${LOG_PREFIX} update machine ${machineId} HTTP ${res.status}`);
+  } catch (e) {
+    console.error(`${LOG_PREFIX} update machine ${machineId} failed (non-fatal)`, e);
+  }
+}
+
+// The license id a machine belongs to (null when the machine doesn't exist).
+async function machineLicenseId(machineId: string): Promise<string | null> {
+  const res = await fetch(`${KEYGEN}/${accountId()}/machines/${encodeURIComponent(machineId)}`, {
+    headers: adminHeaders(),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Keygen get machine HTTP ${res.status}`);
+  const body = await res.json();
+  return body?.data?.relationships?.license?.data?.id ?? null;
+}
+
+// --- pure classifiers (unit-tested) -----------------------------------------
+
+/** Hard-stop base validity from an unscoped validate-key. null → proceed to activate. */
+export function classifyBaseValidity(
+  body: KeygenValidation,
+): { ok: false; status: number; reason: ActivateReason; message: string } | null {
+  const valid = body?.meta?.valid === true;
+  const code = body?.meta?.code ?? "";
+  if (valid) return null;
+  if (NEEDS_ACTIVATION_CODES.includes(code)) return null; // license fine, needs a machine
+  if (code === "EXPIRED") return { ok: false, status: 403, reason: "expired", message: "License expired" };
+  if (code === "SUSPENDED" || code === "BANNED") {
+    return { ok: false, status: 403, reason: "suspended", message: "License suspended" };
+  }
+  return { ok: false, status: 401, reason: "invalid", message: "Invalid license key" };
+}
+
+/** Map a failed machine-create (status + Keygen error codes) to a stable reason. */
+export function classifyCreateConflict(
+  status: number,
+  codes: string[],
+): "seat-limit" | "device-already-registered" | "other" {
+  const c = codes.map((x) => x.toUpperCase());
+  if (c.some((x) => x.includes("MACHINE_LIMIT") || x.includes("TOO_MANY_MACHINES"))) {
+    return "seat-limit";
+  }
+  if (c.some((x) => x.includes("FINGERPRINT") || x.includes("TAKEN") || x.includes("CONFLICT"))) {
+    return "device-already-registered";
+  }
+  return "other";
+}
+
+function extractErrorCodes(body: unknown): string[] {
+  const errors = (body as { errors?: unknown })?.errors;
+  if (!Array.isArray(errors)) return [];
+  const codes: string[] = [];
+  for (const e of errors) {
+    if (typeof e !== "object" || e === null) continue;
+    const err = e as { code?: unknown; detail?: unknown; source?: { pointer?: unknown } };
+    if (typeof err.code === "string") codes.push(err.code);
+    if (typeof err.detail === "string") codes.push(err.detail);
+    const pointer = err.source?.pointer;
+    if (typeof pointer === "string") codes.push(pointer);
+  }
+  return codes;
+}
+
+function policyIdOf(body: KeygenValidation): string | null {
+  return body?.data?.relationships?.policy?.data?.id ?? null;
+}
+
+// Authoritative machine limit for display (the validate-key sideload doesn't
+// reliably carry maxMachines, so read the policy directly). Best-effort: null on
+// any failure — enforcement is Keygen's job, this is only for "N of N".
+async function getPolicyMaxMachines(policyId: string | null): Promise<number | null> {
+  if (!policyId) return null;
+  try {
+    const res = await fetch(`${KEYGEN}/${accountId()}/policies/${encodeURIComponent(policyId)}`, {
+      headers: adminHeaders(),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const max = body?.data?.attributes?.maxMachines;
+    return typeof max === "number" ? max : null;
+  } catch (e) {
+    console.error(`${LOG_PREFIX} read policy ${policyId} failed (non-fatal)`, e);
+    return null;
+  }
+}
+
+function fail(
+  status: number,
+  reason: ActivateReason,
+  message: string,
+  limit?: number | null,
+  used?: number,
+): ActivateResult {
+  return { ok: false, status, reason, message, limit, used };
+}
+
+function asStringOrNull(v: unknown): string | null {
+  return typeof v === "string" ? v : null;
+}
+
+function accountId(): string {
+  return required("KEYGEN_ACCOUNT_ID");
+}
+
+function adminHeaders(): Record<string, string> {
+  return {
+    Authorization: `Bearer ${required("KEYGEN_ADMIN_TOKEN")}`,
+    "Content-Type": "application/vnd.api+json",
+    Accept: "application/vnd.api+json",
+  };
+}
+
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing env var: ${name}`);
+  return value;
+}
