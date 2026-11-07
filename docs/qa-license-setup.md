@@ -12,8 +12,8 @@ That one marker unlocks both QA channels:
 
 - **cc-tmgmt app:** the QA update feed `/api/tmgmt/updates/qa/…` and
   `/api/tmgmt/download?channel=qa` (the "CC Test Management QA" app).
-- **Framework (npm):** pre-release / `rc` versions of `@meintest/*` via the
-  npm proxy (`npm i @meintest/cc-testframework@rc`).
+- **Framework (npm):** pre-release / `rc` versions of `@itsbusinessag/*` via the
+  npm proxy (`npm i @itsbusinessag/cc-testframework@rc`).
 
 A QA license is **not** a separate license type: it is any valid, entitled
 license with `channel = "qa"` added. The same key keeps working on the normal
@@ -61,7 +61,7 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 - **No key** → `401`.
 
 For the framework, a QA license sees the pre-release in
-`npm view @meintest/cc-testframework versions`; a customer license does not.
+`npm view @itsbusinessag/cc-testframework versions`; a customer license does not.
 
 ## Revoke
 

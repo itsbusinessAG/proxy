@@ -41,7 +41,7 @@ With `requireHeartbeat`/`maxMachines` on the framework policy, an **unscoped**
 `validate-key` returns `NO_MACHINES` (i.e. `meta.valid !== true`) whenever no
 machine is active. Today the **npm proxy** (`/api/tmgmt/npm`), `/api/license/status`
 and the feedback gate treat `valid !== true` as **not entitled** — so installing
-`@meintest/cc-testframework` (and status/feedback) would **break** for a license
+`@itsbusinessag/cc-testframework` (and status/feedback) would **break** for a license
 with no active run.
 
 Installing ≠ running — install must not consume a concurrency seat. So the

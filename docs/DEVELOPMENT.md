@@ -47,7 +47,7 @@ Electron-App (electron-updater, generic provider)
    → GET /api/tmgmt/download?os=win|mac|linux&key=<license-key>  (Erst-Download aus der Mail)
 ```
 
-Quelle der Releases: privates Repo `meinTest/cc-test-mgmt-ui` (server-seitig via GitHub-App
+Quelle der Releases: privates Repo `itsbusinessAG/tmt` (server-seitig via GitHub-App
 gelesen; der Kunde bekommt **nie** GitHub-Zugriff).
 
 ---
@@ -77,7 +77,7 @@ Settings → Environment Variables gesetzt. Die wichtigsten Gruppen:
 - **Keygen:** `KEYGEN_ACCOUNT_ID`, `KEYGEN_ADMIN_TOKEN`, `KEYGEN_TRIAL_POLICY_ID`,
   `KEYGEN_TMGMT_TRIAL_POLICY_ID`, `KEYGEN_PENDING_POLICY_ID`.
 - **GitHub App:** `GH_APP_ID`, `GH_APP_PRIVATE_KEY`, `GH_APP_INSTALLATION_ID`, `GH_ORG`,
-  `GH_REPO` (Framework-Repo), `GH_TMGMT_REPO` (= `cc-test-mgmt-ui`, Release-Quelle).
+  `GH_REPO` (Framework-Repo), `GH_TMGMT_REPO` (= `tmt`, Release-Quelle).
 - **Resend:** `RESEND_API_KEY`, `RESEND_FROM`, `RESEND_SUPPORT_TO`, `SALES_NOTIFY_EMAIL`.
 - **Sonstiges:** `SALES_API_KEY` (Bearer für `/api/sales/*` + HMAC-Secret + Basic-Auth für
   `/sales`), `LANDING_BASE_URL` (Basis für gebaute Links), `CRON_SECRET`, `QUICKSTART_URL_*`.
@@ -109,7 +109,7 @@ curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" "$base/download?os=win&
 common="SIGNUP_ENABLED=true SALES_VETTED_MODE=true DRY_RUN=true KEYGEN_ACCOUNT_ID=a \
   KEYGEN_ADMIN_TOKEN=t KEYGEN_TRIAL_POLICY_ID=tp KEYGEN_TMGMT_TRIAL_POLICY_ID=ttp \
   KEYGEN_PENDING_POLICY_ID=pp RESEND_FROM=f@x RESEND_SUPPORT_TO=s@x \
-  GH_ORG=meinTest GH_REPO=cc-testframework GH_APP_ID=1 GH_APP_INSTALLATION_ID=1 GH_APP_PRIVATE_KEY=x"
+  GH_ORG=itsbusinessAG GH_REPO=tfw GH_APP_ID=1 GH_APP_INSTALLATION_ID=1 GH_APP_PRIVATE_KEY=x"
 
 # Framework: GitHub-Username Pflicht, Invite + Welcome
 env $common PORT=3301 npx next start &
@@ -191,6 +191,5 @@ proxy.ts                             Basic-Auth-Middleware für /sales
 - **cc-tmgmt:** live & verifiziert (Proxy + Signup). Offen: Customer-Test-Repo-Hosting
   (Git-Push-Credential), cc-tmgmt-Docs/GitHub-Pages.
 - **Framework-Cutover:** Resend-Subdomain verifizieren, dann `DRY_RUN=false` + `SIGNUP_ENABLED=true`;
-  Custom-Domain `cc-testframework.itsbusiness.ch`. Details: `docs/onboarding.md`,
-  `docs/cc-tmgmt-proxy-integration.md`, `docs/cc-tmgmt-entitlement-options.md`.
+  Custom-Domain `cc-testframework.itsbusiness.ch`. Details: `docs/cc-tmgmt-proxy-integration.md`.
 ```

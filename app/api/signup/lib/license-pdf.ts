@@ -1,7 +1,7 @@
 import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import { LICENSE_LOGO_PNG_BASE64 } from "./license-logo";
 
-// License certificate attached to the welcome mail, laid out after the meinTest
+// License certificate attached to the welcome mail, laid out after the itsbusiness AG
 // letterhead template (Assets/…Lizenzdokumentation_Vorlage.docx). Built with
 // pdf-lib (pure JS) so it runs in Vercel's serverless runtime.
 

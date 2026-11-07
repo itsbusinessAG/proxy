@@ -55,11 +55,11 @@ license-brokered npm proxy (`/api/tmgmt/npm/…`, cc-testframework#216):
 - **Customers** (any entitled license without `channel:qa`) see only the stable
   `latest` chain. Pre-release versions (any semver with a `-`, e.g. `1.3.0-rc.1`)
   and the dist-tags pointing at them (`rc`, `next`, …) are stripped from the
-  packument, so `npm i @meintest/…@rc` fails with "No matching version". A
+  packument, so `npm i @itsbusinessag/…@rc` fails with "No matching version". A
   pre-release tarball requested directly (a guessed URL) returns **403**
   `{ "error": "qa-channel-not-entitled" }`, the same as the QA update feed.
 - **Internal** licenses (`metadata.channel = "qa"`) get the full packument
-  including `rc`, so `npm install @meintest/cc-testframework@rc` works for them.
+  including `rc`, so `npm install @itsbusinessag/cc-testframework@rc` works for them.
 
 The gate reuses the same `channel:qa` marker and the cached entitlement verdict —
 no extra Keygen call. There is no publishing change here: the framework pipeline

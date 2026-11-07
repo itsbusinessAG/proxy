@@ -188,7 +188,7 @@ export async function handleQaUpdateFile(
   }
 }
 
-// --- License-brokered npm registry (@meintest/* + @itsbusinessag/*) ---------
+// --- License-brokered npm registry (@itsbusinessag/*) -----------------------
 //
 // Both scopes are served in parallel during the org move (#57); spec parsing
 // and the scope allowlist live in npm-registry.ts (parseNpmSpec / NPM_SCOPES).
@@ -242,7 +242,7 @@ export async function handleNpm(
   // Never act as an open registry mirror: only the two migration scopes pass.
   const parsed = parseNpmSpec(spec);
   if (parsed.kind === "reject") {
-    return npmError(403, "Only @meintest/* and @itsbusinessag/* packages are served");
+    return npmError(403, "Only @itsbusinessag/* packages are served");
   }
 
   try {

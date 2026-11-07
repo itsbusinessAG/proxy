@@ -1,8 +1,8 @@
 import { handleNpm } from "../../lib/handlers";
 
-// License-brokered npm registry for @meintest/* and @itsbusinessag/* (GitHub
-// Packages), both served in parallel during the org move (#57). Clients set
-//   @itsbusinessag:registry=<origin>/api/tmgmt/npm/   (or @meintest for the old scope)
+// License-brokered npm registry for @itsbusinessag/* (GitHub Packages).
+// Clients set
+//   @itsbusinessag:registry=<origin>/api/tmgmt/npm/
 //   //<origin>/api/tmgmt/npm/:_authToken=${CC_LICENSE_KEY}
 // and can `npm install @itsbusinessag/…` with only a valid license — no GitHub access.
 //

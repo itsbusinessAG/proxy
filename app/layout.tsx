@@ -4,7 +4,7 @@ import "./globals.css";
 import SiteHeader from "./Header";
 import { offeredProducts, type ProductId } from "./products";
 
-// meinTest CI fonts: Open Sans (body) + Scada (headings).
+// itsbusiness AG CI fonts: Open Sans (body) + Scada (headings).
 const openSans = Open_Sans({
   variable: "--font-open-sans",
   subsets: ["latin"],

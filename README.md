@@ -1,7 +1,7 @@
 # cc-testframework-landing
 
 Customer-facing landing page **and** the sales-vetted onboarding/delivery chain for
-[cc-testframework](https://github.com/meinTest/cc-testframework) and CC-Testmanagement (cc-tmgmt).
+[cc-testframework](https://github.com/itsbusinessAG/tfw) and CC-Testmanagement (cc-tmgmt).
 Next.js 16 (App Router), Tailwind CSS, hosted on Vercel.
 
 > **Start here:** [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — run, test, change, deploy
@@ -36,4 +36,4 @@ See `.env.example`. None are wired up in Iter 18 — they become required in Ite
 
 ## Related repos
 
-- [meinTest/cc-testframework](https://github.com/meinTest/cc-testframework) — the test framework itself
+- [itsbusinessAG/tfw](https://github.com/itsbusinessAG/tfw) — the test framework (cc-testframework) itself

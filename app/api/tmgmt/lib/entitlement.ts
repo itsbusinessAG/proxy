@@ -7,14 +7,14 @@ import { coerceProduct, type ProductId } from "../../../products";
 const LOG_PREFIX = "[tmgmt][entitlement]";
 const PRODUCT: ProductId = "TMT";
 // Default gate for the TMT-only resources (download/updates/feedback). The npm
-// registry proxy overrides this — the @meintest/cc-testframework package is
+// registry proxy overrides this — the @itsbusinessag/cc-testframework package is
 // legitimately consumed by both a standalone FW license and a TMT license (which
 // pulls the framework as a dependency).
 const DEFAULT_ALLOWED: readonly ProductId[] = [PRODUCT];
 
 // Shared entitlement gate for the cross-product proxy services: a valid license
 // for EITHER product qualifies. Used by the npm broker (install
-// @meintest/cc-testframework), the /license/status "entitled" verdict (Issue #8),
+// @itsbusinessag/cc-testframework), the /license/status "entitled" verdict (Issue #8),
 // and the feedback endpoints (Issue #10) — one constant so these can never
 // diverge. (The TMT-only resources download/updates keep DEFAULT_ALLOWED.)
 export const ENTITLED_PRODUCTS: readonly ProductId[] = ["FW", "TMT"];

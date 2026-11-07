@@ -37,7 +37,7 @@ Der Lizenzschlüssel ist der Zugangscode, den der Kunde in der App eingibt (= Ke
 - `…/updates/latest-mac.yml`
 - `…/updates/<asset-dateiname>` → **302-Redirect** auf eine kurzlebige GitHub-Asset-URL
 
-Der Proxy liest das jeweils **neueste Release** von `meinTest/cc-test-mgmt-ui`, liefert die
+Der Proxy liest das jeweils **neueste Release** von `itsbusinessAG/tmt`, liefert die
 yml als Text und Assets als Redirect. **Asset-Namen nicht hartkodieren** — sie werden aus der
 yml/Release aufgelöst; neue Versionen/Architekturen funktionieren automatisch.
 

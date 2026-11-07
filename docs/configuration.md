@@ -18,7 +18,7 @@ Eine **Next.js 16 (App Router)**-App, deployed auf **Vercel**, erreichbar unter
 1. **Marketing-Landing** (zweisprachig DE/EN, DE Default).
 2. **Lizenz-/Onboarding-/Delivery-/Billing-Proxy** für zwei Produkte:
    - **TMT** (`cc-tmgmt`, „Verify Test Management") — Electron-Desktop-App.
-   - **FW** (`cc-testframework`, „CC-Testframework") — npm-Paket `@meintest/cc-testframework`.
+   - **FW** (`cc-testframework`, „CC-Testframework") — npm-Paket `@itsbusinessag/cc-testframework`.
 
 Angebundene Systeme:
 
@@ -85,15 +85,15 @@ authentifiziert sich überall mit seinem **Keygen-Lizenzschlüssel**.
 | Variable | Bedeutung |
 |---|---|
 | `GH_APP_ID`, `GH_APP_PRIVATE_KEY`, `GH_APP_INSTALLATION_ID` | GitHub-App-Credentials (Installationstoken je Call). |
-| `GH_ORG` | Org der Release-Repos (`meinTest`). |
-| `GH_TMGMT_REPO` | Privates Repo mit den TMT-Release-Artefakten (`cc-test-mgmt-ui`). |
+| `GH_ORG` | Org der Release-Repos (`itsbusinessAG`). |
+| `GH_TMGMT_REPO` | Privates Repo mit den TMT-Release-Artefakten (`tmt`). |
 | `GH_PACKAGES_TOKEN` | **Classic PAT** mit `read:packages` für den npm-Proxy (GitHub Packages akzeptiert keine App-Tokens). |
 | `NPM_RATE_LIMIT_PER_MIN` | Rate-Limit npm-Proxy pro Lizenz (Default 60/min). |
 
 ### Feedback (In-App → GitHub-Issues)
 | Variable | Bedeutung |
 |---|---|
-| `FEEDBACK_REPO` | `owner/repo` für Feedback-Issues (privat; `meinTest/cc-test-mgmt-ui`). |
+| `FEEDBACK_REPO` | `owner/repo` für Feedback-Issues (privat; `itsbusinessAG/tmt`). |
 | `FEEDBACK_ASSETS_BRANCH` | Orphan-Branch für Screenshots (Default `feedback-assets`). |
 | `FEEDBACK_RATE_LIMIT_PER_MIN` | Rate-Limit Feedback (Default 20/min). |
 
@@ -125,7 +125,7 @@ authentifiziert sich überall mit seinem **Keygen-Lizenzschlüssel**.
 | Id (heute) | Name | Auslieferung |
 |---|---|---|
 | `cc-tmgmt` (→ TMT) | Verify Test Management | Electron-App via Download/Update-Proxy |
-| `cc-testframework` (→ FW) | CC-Testframework | npm `@meintest/cc-testframework` via npm-Proxy |
+| `cc-testframework` (→ FW) | CC-Testframework | npm `@itsbusinessag/cc-testframework` via npm-Proxy |
 
 **Entitlement-Regel (wichtig):**
 - Eine **TMT-Lizenz** schaltet **beide** Produkte frei (TMT-App **und** FW-npm).

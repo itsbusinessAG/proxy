@@ -1,13 +1,10 @@
 import { createAppAuth } from "@octokit/auth-app";
 
-// License-brokered proxy for the private @meintest/* and @itsbusinessag/* npm
-// packages on GitHub Packages. During the org move both scopes are served in
-// parallel — @meintest against the meinTest org, @itsbusinessag against the
-// itsbusinessAG org — so existing customer projects keep installing while new
-// ones use the new scope; there is no shutdown date for @meintest/* (#57). The
-// customer authenticates with their Keygen license (Bearer); the service token
-// stays server-side and never reaches the client, and must be able to read
-// packages in BOTH orgs (a classic PAT with read:packages visible in both).
+// License-brokered proxy for the private @itsbusinessag/* npm packages on
+// GitHub Packages (itsbusinessAG org). The customer authenticates with their
+// Keygen license (Bearer); the service token stays server-side and never
+// reaches the client, and must be able to read packages in the itsbusinessAG
+// org (a classic PAT with read:packages).
 
 const GH_NPM = "https://npm.pkg.github.com";
 const PACKUMENT_TTL_MS = 5 * 60 * 1000;
@@ -32,15 +29,15 @@ interface RawPackument {
   [k: string]: unknown;
 }
 
-// Both scopes served during the org move. Anything outside them is rejected so
-// the proxy never becomes an open registry mirror (#1, #57).
-export const NPM_SCOPES = ["@meintest", "@itsbusinessag"] as const;
+// Only @itsbusinessag/* is served. Anything outside it is rejected so the proxy
+// never becomes an open registry mirror (#1).
+export const NPM_SCOPES = ["@itsbusinessag"] as const;
 
 // @<scope>/<pkg>/-/<file> — GitHub Packages names the tarball with a bare SHA
 // (no .tgz extension), so match anything after `/-/`.
-const TARBALL_RE = /^(@meintest|@itsbusinessag)\/([^/]+)\/-\/(.+)$/;
+const TARBALL_RE = /^(@itsbusinessag)\/([^/]+)\/-\/(.+)$/;
 // @<scope>/<pkg>
-const PACKUMENT_RE = /^(@meintest|@itsbusinessag)\/([^/]+)$/;
+const PACKUMENT_RE = /^(@itsbusinessag)\/([^/]+)$/;
 
 export type NpmSpec =
   | { kind: "tarball"; scope: string; pkg: string; filename: string }
@@ -52,7 +49,7 @@ export type NpmSpec =
  * Classify a raw npm spec (`@scope/pkg` or `@scope/pkg/-/file`). An allowed
  * scope with an unknown shape is `not-found` (→404); any other scope is
  * `reject` (→403). The matched scope is carried through so the upstream fetch
- * and the cache key stay per-scope (#57).
+ * and the cache key stay per-scope.
  */
 export function parseNpmSpec(spec: string): NpmSpec {
   const tar = TARBALL_RE.exec(spec);
@@ -94,16 +91,16 @@ async function installationToken(): Promise<string> {
 
 async function fetchRawPackument(scope: string, pkg: string): Promise<RawPackument> {
   const now = Date.now();
-  // Keyed per scope: @meintest/cc-testframework and @itsbusinessag/cc-testframework
-  // are different packages in different orgs and must never share a cache slot (#57).
+  // Keyed per scope so the cache slot is unambiguous even though only one scope
+  // (@itsbusinessag) is served today.
   const cacheKey = `${scope}/${pkg}`;
   const hit = packumentCache.get(cacheKey);
   if (hit && now - hit.at < PACKUMENT_TTL_MS) return hit.data;
 
   const token = await packagesAuthToken();
-  // GitHub Packages resolves the scope against the matching org (@meintest →
-  // meinTest, @itsbusinessag → itsbusinessAG), so the requested scope is carried
-  // through verbatim rather than hardcoded.
+  // GitHub Packages resolves the scope against the matching org
+  // (@itsbusinessag → itsbusinessAG), so the requested scope is carried through
+  // verbatim rather than hardcoded.
   const res = await fetch(`${GH_NPM}/${scope}%2f${encodeURIComponent(pkg)}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   });
